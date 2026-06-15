@@ -51,11 +51,15 @@ UART_HandleTypeDef huart1;
 /* USER CODE BEGIN PV */
 // MPU6050 與 PID 相關變數
 float Pitch = 0, Roll = 0;
-float Target_Angle = -2.5f; // 機械中性點偏移量 (根據實際重心調整)
+float Target_Angle = -2.3f; // 微調：介於 -2.5 (太快) 與 -2.1 (不動) 之間
 float Kp = 45.0f;           // 比例增益 (需根據實際情況調優)
 float Kd = 1.2f;            // 微分增益 (需根據實際情況調優)
 float Balance_PWM = 0;
 float Last_Error = 0;
+
+// 循跡轉向相關變數
+int Steer_PWM = 0;
+int Track_Speed = 127; // 降低轉向力道：150 * 0.85 = 127.5
 
 uint32_t IC_Val1 = 0;   
 uint32_t IC_Val2 = 0;   
@@ -206,13 +210,26 @@ int main(void)
         // 2. 平衡控制 (PD 計算)
         Balance_PWM = Balance_Control(Pitch, Target_Angle);
 
-        // 3. 輸出馬達控制
-        Motor_Control((int)Balance_PWM, (int)Balance_PWM);
+        // 3. 循跡邏輯 (讀取 PB10/PB11)
+        // 根據實測：黑線燈滅 (0)，白地燈亮 (1)
+        uint8_t L_Sensor = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_10);
+        uint8_t R_Sensor = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_11);
 
-        // 4. 定期串口輸出調試
+        if (L_Sensor == 0 && R_Sensor == 1) {
+            Steer_PWM = -Track_Speed; // 左感測器看到黑線 -> 向左轉修正
+        } else if (L_Sensor == 1 && R_Sensor == 0) {
+            Steer_PWM = Track_Speed;  // 右感測器看到黑線 -> 向右轉修正
+        } else {
+            Steer_PWM = 0;            // 直行或全黑/全白
+        }
+
+        // 4. 輸出整合控制 (平衡 + 轉向)
+        Motor_Control((int)(Balance_PWM + Steer_PWM), (int)(Balance_PWM - Steer_PWM));
+
+        // 5. 定期串口輸出調試
         static int count = 0;
         if (count++ >= 20) { // 約 200ms 輸出一次
-            sprintf(msg, "Angle: %.2f | PWM: %d\r\n", Pitch, (int)Balance_PWM);
+            sprintf(msg, "Angle: %.2f | PWM: %d | Steer: %d\r\n", Pitch, (int)Balance_PWM, Steer_PWM);
             HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 10);
             count = 0;
         }
@@ -452,6 +469,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PB10 PB11 */
+  GPIO_InitStruct.Pin = GPIO_PIN_10|GPIO_PIN_11;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
