@@ -1,9 +1,9 @@
 --cpu Cortex-M3
 "pwm\startup_stm32f103xb.o"
+"pwm\mpu6050.o"
 "pwm\main.o"
 "pwm\stm32f1xx_it.o"
 "pwm\stm32f1xx_hal_msp.o"
-"pwm\mpu6050.o"
 "pwm\stm32f1xx_hal_gpio_ex.o"
 "pwm\stm32f1xx_hal_tim.o"
 "pwm\stm32f1xx_hal_tim_ex.o"

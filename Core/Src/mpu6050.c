@@ -14,12 +14,22 @@ void MPU6050_I2C_Init(void)
     GPIO_InitTypeDef GPIO_InitStruct = {0};
     __HAL_RCC_GPIOB_CLK_ENABLE();
 
-    // 配置 PB8(SCL) 與 PB9(SDA) 為開漏輸出 (Open-Drain)，方便雙向傳輸
+    // 配置 PB8(SCL) 與 PB9(SDA) 為開漏輸出 (Open-Drain)
     GPIO_InitStruct.Pin = SCL_PIN | SDA_PIN;
     GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
     GPIO_InitStruct.Pull = GPIO_PULLUP;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    // [新增] I2C 匯流排復位邏輯
+    // 如果 SDA 被 Slave 拉低（卡死），傳送 9 個時鐘脈衝通常能強迫 Slave 釋放 SDA
+    I2C_SDA_HIGH();
+    for (int i = 0; i < 9; i++) {
+        I2C_SCL_LOW();
+        I2C_Delay(); 
+        I2C_SCL_HIGH();
+        I2C_Delay();
+    }
 
     I2C_SCL_HIGH();
     I2C_SDA_HIGH();
@@ -130,13 +140,13 @@ uint8_t MPU6050_ReadReg(uint8_t reg)
     uint8_t data = 0;
     I2C_Start();
     I2C_WriteByte(MPU6050_ADDR);
-    if (I2C_WaitAck()) return 0;
+    if (I2C_WaitAck()) return 0xFF; // 出錯返回 0xFF 以區別合法數據
     I2C_WriteByte(reg);
-    if (I2C_WaitAck()) return 0;
+    if (I2C_WaitAck()) return 0xFF;
     
     I2C_Start(); // 重複起始訊號
     I2C_WriteByte(MPU6050_ADDR | 0x01); // 讀取指令
-    if (I2C_WaitAck()) return 0;
+    if (I2C_WaitAck()) return 0xFF;
     data = I2C_ReadByte();
     I2C_SendAck(1); // 發送 NACK 結束
     I2C_Stop();
@@ -146,22 +156,29 @@ uint8_t MPU6050_ReadReg(uint8_t reg)
 // MPU6050 初始化
 uint8_t MPU6050_Init(void)
 {
+    uint8_t id = 0;
     MPU6050_I2C_Init();
     
-    HAL_Delay(100);
+    // [修改] 增加電源穩定等待時間
+    HAL_Delay(500);
     
-    // 喚醒 MPU6050，使用內部 8MHz 時鐘
-    if (MPU6050_WriteReg(MPU6050_PWR_MGMT_1, 0x00) != 0) return 1;
-    // 取樣率分頻 = 7，取樣率 = 1kHz
-    MPU6050_WriteReg(MPU6050_SMPLRT_DIV, 0x07);
-    // 低通濾波器配置 (DLPF)，截止頻率約 42Hz
-    MPU6050_WriteReg(MPU6050_CONFIG, 0x03);
-    // 陀螺儀量程配置：+/- 2000度/秒 (0x18)
-    MPU6050_WriteReg(MPU6050_GYRO_CONFIG, 0x18);
-    // 加速度計量程配置：+/- 2g (0x00)
-    MPU6050_WriteReg(MPU6050_ACCEL_CONFIG, 0x00);
+    for (int retry = 0; retry < 5; retry++) {
+        id = MPU6050_ReadReg(MPU6050_WHO_AM_I);
+        // 放寬檢查：只要不是 0xFF (通訊失敗) 且不是 0 (沒讀到)，就試著啟動
+        if (id != 0xFF && id != 0x00) {
+            MPU6050_WriteReg(MPU6050_PWR_MGMT_1, 0x00);
+            MPU6050_WriteReg(MPU6050_SMPLRT_DIV, 0x07);
+            MPU6050_WriteReg(MPU6050_CONFIG, 0x03);
+            MPU6050_WriteReg(MPU6050_GYRO_CONFIG, 0x18);
+            MPU6050_WriteReg(MPU6050_ACCEL_CONFIG, 0x00);
+            
+            HAL_Delay(50);
+            return 0; 
+        }
+        HAL_Delay(100);
+    }
     
-    return 0;
+    return 1;
 }
 
 // 批次讀取加速度計與陀螺儀原始資料
@@ -207,16 +224,13 @@ void MPU6050_Get_Angle(float *Pitch, float *Roll, float dt)
     MPU6050_Read_Data(accel, gyro);
     
     // 改用 Y 軸控制前後 (Pitch)
-    // 當繞 Y 軸旋轉時，重力分量出現在 X 與 Z 軸
     accel_pitch = atan2f((float)-accel[0], (float)accel[2]) * 180.0f / 3.1415926f;
     accel_roll  = atan2f((float)accel[1], (float)accel[2]) * 180.0f / 3.1415926f;
     
-    // 陀螺儀角速度換算 (量程 +/-2000 deg/s 對應 16.4 LSB/(deg/s))
     gyro_x_rate = (float)gyro[0] / 16.4f;
     gyro_y_rate = (float)gyro[1] / 16.4f;
     
     // 互補濾波 (Complementary Filter) 融合角度
-    // 現在 Pitch 的主要動力來源改為 Y 軸角速度
     *Pitch = 0.98f * (*Pitch + gyro_y_rate * dt) + 0.02f * accel_pitch;
     *Roll  = 0.98f * (*Roll + gyro_x_rate * dt) + 0.02f * accel_roll;
 }

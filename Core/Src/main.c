@@ -51,26 +51,21 @@ UART_HandleTypeDef huart1;
 /* USER CODE BEGIN PV */
 // MPU6050 與 PID 相關變數
 float Pitch = 0, Roll = 0;
-float Target_Angle = -2.3f; // 微調：介於 -2.5 (太快) 與 -2.1 (不動) 之間
-float Kp = 45.0f;           // 比例增益 (需根據實際情況調優)
-float Kd = 1.2f;            // 微分增益 (需根據實際情況調優)
+float Target_Angle = -1.5f; // [修改] 根據實際重心微調中值 (正負 2.0 內調整)
+float Kp = 38.0f;           // [調低] 減少噴射感
+float Ki = 0.8f;            // [新增] 積分增益，用來站直
+float Kd = 2.8f;            // [修改] 微調 Kd 增加穩定性
 float Balance_PWM = 0;
 float Last_Error = 0;
+float Bias_Integral = 0;    // [新增] 積分累加變數
 
-// 循跡轉向相關變數
-int Steer_PWM = 0;
-int Track_Speed = 127; // 降低轉向力道：150 * 0.85 = 127.5
-
-uint32_t IC_Val1 = 0;   
-uint32_t IC_Val2 = 0;   
-float DutyCycle = 0;    
-float Frequency = 0;    
-
-float TotalPeriod_ms = 0; // 總週期 (ms)
-float OnTime_ms = 0;      // 導通時間 (ms)
-float OffTime_ms = 0;     // 關閉時間 (ms)
 char msg[128];
+float Steer_PWM = 0;
+float Track_Speed = 100.0f; // [稍微調高] 確保轉向有力
+uint32_t IC_Val1 = 0, IC_Val2 = 0;
+float Frequency = 0, DutyCycle = 0, OnTime_ms = 0, OffTime_ms = 0, TotalPeriod_ms = 0;
 
+uint8_t is_mpu6050_ok = 0; // [新增] 紀錄感測器是否正常啟動
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -87,39 +82,57 @@ float Balance_Control(float Angle, float Target);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 /**
-  * @brief  直立平衡控制 (PD 演算法)
+  * @brief  直立平衡控制 (PID 演算法)
   * @param  Angle: 目前 Pitch 角度
   * @param  Target: 目標角度 (中性點)
   */
 float Balance_Control(float Angle, float Target)
 {
     float Error = Angle - Target;
-    float Output;
     
-    // PD 控制器：Output = Kp * Error + Kd * Error_Dot
-    Output = Kp * Error + Kd * (Error - Last_Error);
+    // 1. 積分累加 (Ki) - 只有在角度小於 30 度時才累積，避免翻車時積分暴走
+    if (Angle < 30.0f && Angle > -30.0f) {
+        Bias_Integral += Error;
+    } else {
+        Bias_Integral = 0; // 角度太大時清空積分
+    }
+    
+    // 2. 限制積分上限 (Anti-Windup)
+    if (Bias_Integral > 1000) Bias_Integral = 1000;
+    if (Bias_Integral < -1000) Bias_Integral = -1000;
+    
+    // 3. PID 計算：Output = Kp*E + Ki*I + Kd*D
+    float Output = Kp * Error + Ki * Bias_Integral + Kd * (Error - Last_Error);
     Last_Error = Error;
     
     return Output;
 }
 
 /**
-  * @brief  控制馬達速度與方向 (安全限制版)
+  * @brief  控制馬達速度與方向 (安全限制與死區補償版)
   * @param  left_speed: 左輪速度 (-1000 到 1000)
   * @param  right_speed: 右輪速度 (-1000 到 1000)
   */
 void Motor_Control(int left_speed, int right_speed)
 {
-    // 安全限制：PWM 絕對不超過 80% (800/1000)
-    const int MAX_PWM = 800;
+    const int MAX_PWM = 600;   
+    const int DEAD_ZONE = 160; // [稍微調高] 確保基礎扭力足以轉彎
 
-    // 傾倒保護：角度超過 45 度自動停機
-    if (Pitch > 45.0f || Pitch < -45.0f) {
+    // 傾倒保護：角度超過 70 度自動停機
+    if (Pitch > 70.0f || Pitch < -70.0f) {
         left_speed = 0;
         right_speed = 0;
+        Bias_Integral = 0; // 停機時清空積分
         HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET); // 進入待機
     } else {
         HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET);   // 正常啟動
+        
+        // [新增] 死區補償：確保小角度也能推動馬達
+        if (left_speed > 0) left_speed += DEAD_ZONE;
+        else if (left_speed < 0) left_speed -= DEAD_ZONE;
+        
+        if (right_speed > 0) right_speed += DEAD_ZONE;
+        else if (right_speed < 0) right_speed -= DEAD_ZONE;
     }
 
     // 方向控制與 PWM 設定
@@ -182,10 +195,17 @@ int main(void)
   MX_TIM2_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  // 初始化 MPU6050
-  if (MPU6050_Init() != 0) {
-      sprintf(msg, "MPU6050 Init Failed!\r\n");
-      HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+  // [修改] 初始化 MPU6050 並紀錄結果
+  if (MPU6050_Init() == 0) {
+      is_mpu6050_ok = 1;
+      sprintf(msg, "MPU6050 OK!\r\n");
+      HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
+  } else {
+      is_mpu6050_ok = 0;
+      sprintf(msg, "MPU6050 FAIL! ID error or bus stuck.\r\n");
+      HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
+      // 初始化失敗時，確保馬達處於安全狀態
+      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);
   }
 
   /* 啟動 TIM1 的 PWM 輸出 */
@@ -199,40 +219,49 @@ int main(void)
   uint32_t last_tick = HAL_GetTick();
   while (1)
   {
-    // 固定頻率控制 (約 100Hz = 10ms)
-    if (HAL_GetTick() - last_tick >= 10) {
+    // [修改] 只有感測器正常時才進行 PID 控制
+    if (is_mpu6050_ok && (HAL_GetTick() - last_tick >= 10)) {
         float dt = (HAL_GetTick() - last_tick) / 1000.0f;
         last_tick = HAL_GetTick();
 
         // 1. 讀取角度
         MPU6050_Get_Angle(&Pitch, &Roll, dt);
 
-        // 2. 平衡控制 (PD 計算)
-        Balance_PWM = Balance_Control(Pitch, Target_Angle);
+        // 2. 平衡控制 (PD 計算) - 加上負號修正方向
+        Balance_PWM = -Balance_Control(Pitch, Target_Angle);
 
         // 3. 循跡邏輯 (讀取 PB10/PB11)
-        // 根據實測：黑線燈滅 (0)，白地燈亮 (1)
         uint8_t L_Sensor = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_10);
         uint8_t R_Sensor = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_11);
 
+        float velocity_scale = 1.0f; 
+        
         if (L_Sensor == 0 && R_Sensor == 1) {
-            Steer_PWM = -Track_Speed; // 左感測器看到黑線 -> 向左轉修正
+            Steer_PWM = -Track_Speed; 
+            velocity_scale = 0.85f; // [修改] 轉向時輕微減速即可 (打 85 折)
         } else if (L_Sensor == 1 && R_Sensor == 0) {
-            Steer_PWM = Track_Speed;  // 右感測器看到黑線 -> 向右轉修正
+            Steer_PWM = Track_Speed;  
+            velocity_scale = 0.85f; // [修改] 轉向時輕微減速即可 (打 85 折)
         } else {
-            Steer_PWM = 0;            // 直行或全黑/全白
+            Steer_PWM = 0;
+            velocity_scale = 1.0f;            
         }
 
         // 4. 輸出整合控制 (平衡 + 轉向)
-        Motor_Control((int)(Balance_PWM + Steer_PWM), (int)(Balance_PWM - Steer_PWM));
+        // 將 Balance_PWM 乘上縮放係數達成減速效果
+        Motor_Control((int)(Balance_PWM * velocity_scale + Steer_PWM), (int)(Balance_PWM * velocity_scale - Steer_PWM));
 
         // 5. 定期串口輸出調試
         static int count = 0;
-        if (count++ >= 20) { // 約 200ms 輸出一次
-            sprintf(msg, "Angle: %.2f | PWM: %d | Steer: %d\r\n", Pitch, (int)Balance_PWM, Steer_PWM);
+        if (count++ >= 20) { 
+            sprintf(msg, "Angle: %.2f | PWM: %d | Steer: %d\r\n", Pitch, (int)Balance_PWM, (int)Steer_PWM);
             HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 10);
             count = 0;
         }
+    } else if (!is_mpu6050_ok) {
+        // 感測器異常時，強制停機保護
+        Motor_Control(0, 0);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);
     }
     /* USER CODE END WHILE */
 
@@ -462,10 +491,12 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5|GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5|GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14 
+                          |GPIO_PIN_15, GPIO_PIN_RESET);
 
   /*Configure GPIO pins : PB5 PB12 PB13 PB14 PB15 */
-  GPIO_InitStruct.Pin = GPIO_PIN_5|GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15;
+  GPIO_InitStruct.Pin = GPIO_PIN_5|GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14 
+                          |GPIO_PIN_15;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
